@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """Mac Stickies → Notion 同步脚本"""
 
+import colorsys
 import hashlib
 import json
 import logging
 import os
+import re
 import requests
 import subprocess
 import sys
+from html.parser import HTMLParser
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple, TypedDict
 
 # ── 配置 ──────────────────────────────────────────────────────────────────────
 STICKIES_DIR = os.path.expanduser(
@@ -33,10 +36,191 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ── RTF 读取 ──────────────────────────────────────────────────────────────────
-def read_stickies(stickies_dir: str) -> List[Tuple[str, float]]:
+# ── 富文本数据模型 ──────────────────────────────────────────────────────────────
+class Run(TypedDict):
+    text: str
+    bold: bool
+    color: str  # Notion color name, e.g. "default", "red", "blue"
+
+
+# ── 颜色转换 ──────────────────────────────────────────────────────────────────
+def hex_to_notion_color(hex_color: str) -> str:
+    """将 #RRGGBB 十六进制颜色转换为 Notion 颜色名称。"""
+    hex_color = hex_color.strip()
+    if not re.fullmatch(r"#[0-9a-fA-F]{6}", hex_color):
+        return "default"
+
+    r = int(hex_color[1:3], 16) / 255.0
+    g = int(hex_color[3:5], 16) / 255.0
+    b = int(hex_color[5:7], 16) / 255.0
+
+    h, s, _ = colorsys.rgb_to_hsv(r, g, b)
+    hue = h * 360  # 0–360
+
+    if s < 0.2:
+        return "default"
+
+    if hue <= 20 or hue > 340:
+        return "red"
+    elif hue <= 45:
+        return "orange"
+    elif hue <= 70:
+        return "yellow"
+    elif hue <= 165:
+        return "green"
+    elif hue <= 260:
+        return "blue"
+    elif hue <= 290:
+        return "purple"
+    else:
+        return "pink"
+
+
+# ── HTML 解析 ─────────────────────────────────────────────────────────────────
+def _parse_css_classes(style_text: str) -> dict:
     """
-    读取所有 Stickies 便签，返回 [(plain_text, mtime), ...] 按 mtime 倒序。
+    解析 <style> 块，返回 {class_name: {"bold": bool, "color": notion_color}} 映射。
+    例如：{"p1": {"bold": True, "color": "default"}, "s1": {"bold": False, "color": "red"}}
+    """
+    classes = {}
+    # 匹配 .classname { ... } 或 p.classname { ... } 或 span.classname { ... }
+    for block_match in re.finditer(r"[\w.]*\.(\w+)\s*\{([^}]+)\}", style_text):
+        class_name = block_match.group(1)
+        body = block_match.group(2)
+
+        # 检测 bold：font-family 包含 Semibold 或 Bold
+        font_match = re.search(r"font:[^;']*'([^']+)'", body)
+        is_bold = False
+        if font_match:
+            family = font_match.group(1)
+            is_bold = "Semibold" in family or "Bold" in family
+
+        # 检测颜色（排除 background-color）
+        color_match = re.search(r"(?<!-)color:\s*(#[0-9a-fA-F]{6})", body)
+        notion_color = "default"
+        if color_match:
+            notion_color = hex_to_notion_color(color_match.group(1))
+
+        classes[class_name] = {"bold": is_bold, "color": notion_color}
+
+    return classes
+
+
+class _StickyHTMLParser(HTMLParser):
+    """解析 textutil 生成的 HTML，提取段落和行内格式。"""
+
+    def __init__(self, css_classes: dict):
+        super().__init__()
+        self._css = css_classes
+
+        self._in_body = False
+        self._in_para = False
+
+        # 段落级属性（由 <p class="..."> 决定）
+        self._para_bold = False
+        self._para_color = "default"
+
+        # 行内状态
+        self._bold_depth = 0
+        self._span_color_stack: List[Optional[str]] = []
+
+        # 当前段落累积的 runs
+        self._current_runs: List[Run] = []
+        self._para_has_content = False
+
+        # 所有段落结果
+        self.paragraphs: List[List[Run]] = []
+
+    def _eff_bold(self) -> bool:
+        return self._bold_depth > 0 or self._para_bold
+
+    def _eff_color(self) -> str:
+        # 取 span_color_stack 中最顶端的非 None 值，否则用段落颜色
+        for color in reversed(self._span_color_stack):
+            if color is not None:
+                return color
+        return self._para_color
+
+    def handle_starttag(self, tag: str, attrs):
+        attrs_dict = dict(attrs)
+
+        if tag == "body":
+            self._in_body = True
+            return
+
+        if not self._in_body:
+            return
+
+        if tag == "p":
+            self._in_para = True
+            self._current_runs = []
+            self._para_has_content = False
+            self._bold_depth = 0
+            self._span_color_stack = []
+
+            cls = attrs_dict.get("class", "")
+            style = self._css.get(cls, {})
+            self._para_bold = style.get("bold", False)
+            self._para_color = style.get("color", "default")
+
+        elif tag == "b" and self._in_para:
+            self._bold_depth += 1
+
+        elif tag == "span" and self._in_para:
+            cls = attrs_dict.get("class", "")
+            style = self._css.get(cls, {})
+            # 只有 span 有明确颜色样式时才推入颜色，否则推入 None（继承段落颜色）
+            color = style.get("color") if cls and cls in self._css else None
+            self._span_color_stack.append(color)
+
+    def handle_endtag(self, tag: str):
+        if not self._in_body:
+            return
+
+        if tag == "p":
+            if self._para_has_content:
+                self.paragraphs.append(self._current_runs)
+            else:
+                self.paragraphs.append([])  # 空段落 → 空 rich_text
+            self._in_para = False
+            self._current_runs = []
+
+        elif tag == "b" and self._in_para:
+            self._bold_depth = max(0, self._bold_depth - 1)
+
+        elif tag == "span" and self._in_para:
+            if self._span_color_stack:
+                self._span_color_stack.pop()
+
+    def handle_data(self, data: str):
+        if not (self._in_body and self._in_para):
+            return
+        if data:
+            self._para_has_content = True
+            self._current_runs.append(
+                Run(text=data, bold=self._eff_bold(), color=self._eff_color())
+            )
+
+
+def parse_html_to_paragraphs(html: str) -> List[List[Run]]:
+    """将 textutil -convert html 输出的 HTML 解析为段落列表。"""
+    # 提取 <style> 块
+    style_match = re.search(
+        r"<style[^>]*>(.*?)</style>", html, re.DOTALL | re.IGNORECASE
+    )
+    style_text = style_match.group(1) if style_match else ""
+    css_classes = _parse_css_classes(style_text)
+
+    parser = _StickyHTMLParser(css_classes)
+    parser.feed(html)
+    return parser.paragraphs
+
+
+# ── RTF 读取 ──────────────────────────────────────────────────────────────────
+def read_stickies(stickies_dir: str) -> List[Tuple[List[List[Run]], float]]:
+    """
+    读取所有 Stickies 便签，返回 [(paragraphs, mtime), ...] 按 mtime 倒序。
+    paragraphs 为 List[List[Run]]，每个内层列表代表一个段落。
     空内容或解析失败的便签会被跳过。
     """
     stickies_path = Path(stickies_dir)
@@ -44,7 +228,7 @@ def read_stickies(stickies_dir: str) -> List[Tuple[str, float]]:
         log.warning("Stickies 目录不存在: %s", stickies_dir)
         return []
 
-    results: List[Tuple[str, float]] = []
+    results: List[Tuple[List[List[Run]], float]] = []
 
     for bundle in stickies_path.glob("*.rtfd"):
         rtf_file = bundle / "TXT.rtf"
@@ -53,7 +237,7 @@ def read_stickies(stickies_dir: str) -> List[Tuple[str, float]]:
             continue
 
         proc = subprocess.run(
-            ["textutil", "-convert", "txt", "-stdout", str(rtf_file)],
+            ["textutil", "-convert", "html", "-stdout", str(rtf_file)],
             capture_output=True,
             text=True,
             timeout=10,
@@ -63,22 +247,29 @@ def read_stickies(stickies_dir: str) -> List[Tuple[str, float]]:
             log.warning("textutil 解析失败: %s", bundle.name)
             continue
 
-        text = proc.stdout.strip()
-        if not text:
+        paragraphs = parse_html_to_paragraphs(proc.stdout)
+
+        # 检查是否有实质性内容（至少一个 run 含非空文本）
+        has_content = any(any(r["text"].strip() for r in para) for para in paragraphs)
+        if not has_content:
             log.debug("跳过空便签: %s", bundle.name)
             continue
 
         mtime = rtf_file.stat().st_mtime
-        results.append((text, mtime))
+        results.append((paragraphs, mtime))
 
     results.sort(key=lambda x: x[1], reverse=True)
     return results
 
 
 # ── Hash + 状态 ───────────────────────────────────────────────────────────────
-def compute_hash(stickies: List[Tuple[str, float]]) -> str:
-    """根据便签文本内容（忽略 mtime）计算 MD5 hash。"""
-    combined = "\n---\n".join(text for text, _ in stickies)
+def compute_hash(stickies: List[Tuple[List[List[Run]], float]]) -> str:
+    """根据便签段落内容（忽略 mtime）计算 MD5 hash。bold/color 变化也会触发重算。"""
+    combined = json.dumps(
+        [paragraphs for paragraphs, _ in stickies],
+        ensure_ascii=False,
+        sort_keys=True,
+    )
     return hashlib.md5(combined.encode("utf-8")).hexdigest()
 
 
@@ -179,18 +370,28 @@ def notion_clear_page(page_id: str) -> None:
         cursor = data.get("next_cursor")
 
 
-def stickies_to_blocks(stickies: List[Tuple[str, float]]) -> list:
+def stickies_to_blocks(stickies: List[Tuple[List[List[Run]], float]]) -> list:
     """将便签列表转换为 Notion block 对象列表。"""
     blocks = []
-    for i, (text, _) in enumerate(stickies):
-        lines = [line for line in text.splitlines() if line.strip()]
-        for line in lines:
+    for i, (paragraphs, _) in enumerate(stickies):
+        for para in paragraphs:
+            # 过滤掉空文本的 run
+            content_runs = [r for r in para if r["text"]]
+            rich_text = [
+                {
+                    "type": "text",
+                    "text": {"content": r["text"]},
+                    "annotations": {
+                        "bold": r["bold"],
+                        "color": r["color"],
+                    },
+                }
+                for r in content_runs
+            ]
             blocks.append(
                 {
                     "type": "paragraph",
-                    "paragraph": {
-                        "rich_text": [{"type": "text", "text": {"content": line}}]
-                    },
+                    "paragraph": {"rich_text": rich_text},
                 }
             )
         if i < len(stickies) - 1:
@@ -198,7 +399,9 @@ def stickies_to_blocks(stickies: List[Tuple[str, float]]) -> list:
     return blocks
 
 
-def notion_write_stickies(page_id: str, stickies: List[Tuple[str, float]]) -> None:
+def notion_write_stickies(
+    page_id: str, stickies: List[Tuple[List[List[Run]], float]]
+) -> None:
     """将便签内容写入 Notion 页面（每批最多 100 blocks）。"""
     blocks = stickies_to_blocks(stickies)
     log.info("写入 %d 个 blocks 到页面 %s", len(blocks), page_id)
