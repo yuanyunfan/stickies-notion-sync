@@ -72,3 +72,27 @@ def read_stickies(stickies_dir: str) -> List[Tuple[str, float]]:
 
     results.sort(key=lambda x: x[1], reverse=True)
     return results
+
+
+# ── Hash + 状态 ───────────────────────────────────────────────────────────────
+def compute_hash(stickies: List[Tuple[str, float]]) -> str:
+    """根据便签文本内容（忽略 mtime）计算 MD5 hash。"""
+    combined = "\n---\n".join(text for text, _ in stickies)
+    return hashlib.md5(combined.encode("utf-8")).hexdigest()
+
+
+def load_state(state_file: str = STATE_FILE) -> dict:
+    """读取 state.json，损坏或缺失时返回默认值。"""
+    default = {"hash": None, "notion_page_id": None}
+    try:
+        with open(state_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
+def save_state(state_file: str, state: dict) -> None:
+    """持久化 state 到 JSON 文件，目录不存在时自动创建。"""
+    os.makedirs(os.path.dirname(state_file) or ".", exist_ok=True)
+    with open(state_file, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
