@@ -2,8 +2,19 @@ import os
 import tempfile
 import subprocess
 import pytest
+import requests
 from unittest.mock import patch, MagicMock
-from sync_stickies import read_stickies
+from sync_stickies import (
+    read_stickies,
+    compute_hash,
+    load_state,
+    save_state,
+    notion_headers,
+    notion_find_or_create_page,
+    notion_clear_page,
+    notion_write_stickies,
+    stickies_to_blocks,
+)
 
 STICKIES_DIR = os.path.expanduser(
     "~/Library/Containers/com.apple.Stickies/Data/Library/Stickies"
@@ -88,9 +99,6 @@ def test_read_stickies_handles_textutil_failure():
         assert result == []
 
 
-from sync_stickies import compute_hash, load_state, save_state
-
-
 def test_compute_hash_deterministic():
     """相同输入，hash 相同"""
     stickies = [("hello world", 1.0), ("second sticky", 2.0)]
@@ -134,16 +142,6 @@ def test_save_and_load_state_roundtrip(tmp_path):
     data = {"hash": "abc123", "notion_page_id": "xxx-yyy"}
     save_state(path, data)
     assert load_state(path) == data
-
-
-import requests
-from sync_stickies import (
-    notion_headers,
-    notion_find_or_create_page,
-    notion_clear_page,
-    notion_write_stickies,
-    stickies_to_blocks,
-)
 
 
 def test_notion_headers_contain_auth():
@@ -206,12 +204,13 @@ def test_notion_find_or_create_page_reuses_existing():
 
 
 def test_notion_clear_page_handles_pagination():
-    """has_more=True 时应继续循环，直到 has_more=False 才停止"""
+    """has_more=True 时应继续循环，第二次请求携带 start_cursor"""
     block_resp_1 = MagicMock()
     block_resp_1.raise_for_status = MagicMock()
     block_resp_1.json.return_value = {
         "results": [{"id": "block-1"}],
         "has_more": True,
+        "next_cursor": "cursor-abc",
     }
     block_resp_2 = MagicMock()
     block_resp_2.raise_for_status = MagicMock()
@@ -228,3 +227,31 @@ def test_notion_clear_page_handles_pagination():
 
     assert mock_get.call_count == 2
     assert mock_del.call_count == 1
+    # 第二次调用应携带 start_cursor
+    second_call_kwargs = mock_get.call_args_list[1][1]
+    assert second_call_kwargs.get("params", {}).get("start_cursor") == "cursor-abc"
+
+
+def test_notion_write_stickies_calls_patch():
+    """notion_write_stickies 应调用 PATCH /blocks/{id}/children"""
+    stickies = [("hello", 1.0)]
+    mock_resp = MagicMock()
+    mock_resp.raise_for_status = MagicMock()
+    with patch("requests.patch", return_value=mock_resp) as mock_patch:
+        notion_write_stickies("page-123", stickies)
+    mock_patch.assert_called_once()
+    call_kwargs = mock_patch.call_args
+    assert "page-123" in call_kwargs[0][0]  # URL contains page id
+
+
+def test_notion_write_stickies_batches_large_input():
+    """超过 100 个 blocks 时应分多次调用 PATCH"""
+    # 101 条单行便签 → 101 个 paragraph blocks (无 divider，因为每条便签只有1行且测试不关心格式)
+    # 实际 stickies_to_blocks 会在便签间插入 divider，构造足够多的块即可
+    stickies = [(f"sticky {i}", float(i)) for i in range(60)]
+    mock_resp = MagicMock()
+    mock_resp.raise_for_status = MagicMock()
+    with patch("requests.patch", return_value=mock_resp) as mock_patch:
+        notion_write_stickies("page-456", stickies)
+    # 60 条便签 × 1 paragraph + 59 dividers = 119 blocks → 需要 2 次 PATCH
+    assert mock_patch.call_count == 2

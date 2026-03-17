@@ -134,10 +134,13 @@ def notion_find_or_create_page(page_id: str | None) -> str:
 def notion_clear_page(page_id: str) -> None:
     """删除页面中所有现有 blocks。"""
     log.info("清空页面 blocks: %s", page_id)
+    cursor = None
     while True:
+        params = {"start_cursor": cursor} if cursor else {}
         resp = requests.get(
             f"{NOTION_API}/blocks/{page_id}/children",
             headers=notion_headers(),
+            params=params,
             timeout=10,
         )
         resp.raise_for_status()
@@ -153,6 +156,7 @@ def notion_clear_page(page_id: str) -> None:
 
         if not data.get("has_more"):
             break
+        cursor = data.get("next_cursor")
 
 
 def stickies_to_blocks(stickies: List[Tuple[str, float]]) -> list:
