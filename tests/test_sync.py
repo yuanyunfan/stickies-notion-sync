@@ -14,6 +14,7 @@ from sync_stickies import (
     notion_clear_page,
     notion_write_stickies,
     stickies_to_blocks,
+    main,
 )
 
 STICKIES_DIR = os.path.expanduser(
@@ -184,15 +185,23 @@ def test_stickies_to_blocks_skips_empty_lines():
 
 
 def test_notion_find_or_create_page_creates_when_not_found():
-    """page_id 为 None 时调用 POST /pages"""
-    mock_resp = MagicMock()
-    mock_resp.status_code = 200
-    mock_resp.json.return_value = {"id": "new-page-id"}
-    mock_resp.raise_for_status = MagicMock()
-    with patch("requests.post", return_value=mock_resp) as mock_post:
+    """page_id 为 None 且搜索无结果时调用 POST /pages 创建"""
+    mock_search_resp = MagicMock()
+    mock_search_resp.status_code = 200
+    mock_search_resp.json.return_value = {"results": []}
+    mock_search_resp.raise_for_status = MagicMock()
+
+    mock_create_resp = MagicMock()
+    mock_create_resp.status_code = 200
+    mock_create_resp.json.return_value = {"id": "new-page-id"}
+    mock_create_resp.raise_for_status = MagicMock()
+
+    with patch(
+        "requests.post", side_effect=[mock_search_resp, mock_create_resp]
+    ) as mock_post:
         page_id = notion_find_or_create_page(None)
     assert page_id == "new-page-id"
-    mock_post.assert_called_once()
+    assert mock_post.call_count == 2
 
 
 def test_notion_find_or_create_page_reuses_existing():
@@ -255,3 +264,72 @@ def test_notion_write_stickies_batches_large_input():
         notion_write_stickies("page-456", stickies)
     # 60 条便签 × 1 paragraph + 59 dividers = 119 blocks → 需要 2 次 PATCH
     assert mock_patch.call_count == 2
+
+
+def test_main_no_change_skips_notion(tmp_path):
+    """hash 未变化时不调用任何 Notion API"""
+    stickies = [("hello", 1.0)]
+    current_hash = compute_hash(stickies)
+    state_file = str(tmp_path / "state.json")
+    save_state(state_file, {"hash": current_hash, "notion_page_id": "existing-id"})
+
+    with (
+        patch("sync_stickies.read_stickies", return_value=stickies),
+        patch("requests.post") as mock_post,
+        patch("requests.patch") as mock_patch,
+        patch("requests.get") as mock_get,
+        patch("requests.delete") as mock_del,
+    ):
+        main(state_file=state_file)
+
+    mock_post.assert_not_called()
+    mock_patch.assert_not_called()
+
+
+def test_main_with_change_calls_notion(tmp_path):
+    """hash 变化时调用 Notion 清空 + 写入"""
+    stickies = [("new content", 1.0)]
+    state_file = str(tmp_path / "state.json")
+    save_state(state_file, {"hash": "old_hash", "notion_page_id": "existing-id"})
+
+    mock_get_resp = MagicMock()
+    mock_get_resp.status_code = 200
+    mock_get_resp.json.return_value = {"results": [], "has_more": False}
+    mock_get_resp.raise_for_status = MagicMock()
+
+    mock_patch_resp = MagicMock()
+    mock_patch_resp.status_code = 200
+    mock_patch_resp.raise_for_status = MagicMock()
+
+    with (
+        patch("sync_stickies.read_stickies", return_value=stickies),
+        patch("requests.get", return_value=mock_get_resp),
+        patch("requests.patch", return_value=mock_patch_resp),
+    ):
+        main(state_file=state_file)
+
+    # state 应被更新
+    new_state = load_state(state_file)
+    assert new_state["hash"] == compute_hash(stickies)
+    assert new_state["notion_page_id"] == "existing-id"
+
+
+def test_main_api_failure_does_not_update_state(tmp_path):
+    """Notion API 抛出异常时，state.json 不应被更新"""
+    stickies = [("some content", 1.0)]
+    old_hash = "old_hash"
+    state_file = str(tmp_path / "state.json")
+    save_state(state_file, {"hash": old_hash, "notion_page_id": "existing-id"})
+
+    with (
+        patch("sync_stickies.read_stickies", return_value=stickies),
+        patch("requests.get", side_effect=Exception("API unreachable")),
+    ):
+        try:
+            main(state_file=state_file)
+        except Exception:
+            pass
+
+    # state 必须保持不变
+    state_after = load_state(state_file)
+    assert state_after["hash"] == old_hash

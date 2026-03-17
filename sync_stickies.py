@@ -110,12 +110,32 @@ def notion_headers() -> dict:
 
 def notion_find_or_create_page(page_id: str | None) -> str:
     """
-    若 page_id 已有则直接返回；否则在 workspace 根目录创建 "Mac stickies" 页面。
+    若 page_id 已有则直接返回；否则先搜索 "Mac stickies" 页面，
+    找到则复用，找不到才创建（需要 integration 有对应 parent 访问权限）。
     """
     if page_id:
         return page_id
 
-    log.info("创建 Notion 页面: %s", PAGE_TITLE)
+    # 先搜索已有页面
+    log.info("搜索已有 Notion 页面: %s", PAGE_TITLE)
+    search_resp = requests.post(
+        f"{NOTION_API}/search",
+        headers=notion_headers(),
+        json={"query": PAGE_TITLE, "filter": {"value": "page", "property": "object"}},
+        timeout=10,
+    )
+    search_resp.raise_for_status()
+    results = search_resp.json().get("results", [])
+    for page in results:
+        props = page.get("properties", {})
+        title_parts = props.get("title", {}).get("title", [])
+        title_text = "".join(p.get("plain_text", "") for p in title_parts)
+        if title_text.strip() == PAGE_TITLE:
+            found_id = page["id"]
+            log.info("找到已有页面: %s", found_id)
+            return found_id
+
+    log.info("未找到已有页面，创建新页面: %s", PAGE_TITLE)
     resp = requests.post(
         f"{NOTION_API}/pages",
         headers=notion_headers(),
@@ -194,3 +214,43 @@ def notion_write_stickies(page_id: str, stickies: List[Tuple[str, float]]) -> No
             timeout=10,
         )
         resp.raise_for_status()
+
+
+# ── 主流程 ────────────────────────────────────────────────────────────────────
+def main(
+    stickies_dir: str = STICKIES_DIR,
+    state_file: str = STATE_FILE,
+) -> None:
+    """主同步流程。"""
+    # 1. 读取便签
+    stickies = read_stickies(stickies_dir)
+    if not stickies:
+        log.info("没有便签，退出")
+        return
+
+    # 2. 计算 hash，与上次对比
+    current_hash = compute_hash(stickies)
+    state = load_state(state_file)
+
+    if state["hash"] == current_hash:
+        log.info("内容无变化，跳过同步")
+        return
+
+    log.info("检测到内容变化，开始同步到 Notion")
+
+    # 3. 同步到 Notion
+    page_id = notion_find_or_create_page(state.get("notion_page_id"))
+    notion_clear_page(page_id)
+    notion_write_stickies(page_id, stickies)
+
+    # 4. 更新状态
+    save_state(state_file, {"hash": current_hash, "notion_page_id": page_id})
+    log.info("同步完成")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        log.exception("同步失败: %s", e)
+        sys.exit(1)
