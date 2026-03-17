@@ -358,6 +358,8 @@ def notion_clear_page(page_id: str) -> None:
         data = resp.json()
 
         for block in data.get("results", []):
+            if block.get("archived") or block.get("in_trash"):
+                continue
             del_resp = requests.delete(
                 f"{NOTION_API}/blocks/{block['id']}",
                 headers=notion_headers(),
