@@ -1,0 +1,6 @@
+state.json
+*.log
+__pycache__/
+*.pyc
+.env
+com.user.stickies-sync.plist
