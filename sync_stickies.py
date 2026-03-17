@@ -122,7 +122,7 @@ def notion_find_or_create_page(page_id: str | None) -> str:
         f"{NOTION_API}/search",
         headers=notion_headers(),
         json={"query": PAGE_TITLE, "filter": {"value": "page", "property": "object"}},
-        timeout=10,
+        timeout=30,
     )
     search_resp.raise_for_status()
     results = search_resp.json().get("results", [])
@@ -145,7 +145,7 @@ def notion_find_or_create_page(page_id: str | None) -> str:
                 "title": {"title": [{"type": "text", "text": {"content": PAGE_TITLE}}]}
             },
         },
-        timeout=10,
+        timeout=30,
     )
     resp.raise_for_status()
     return resp.json()["id"]
@@ -161,7 +161,7 @@ def notion_clear_page(page_id: str) -> None:
             f"{NOTION_API}/blocks/{page_id}/children",
             headers=notion_headers(),
             params=params,
-            timeout=10,
+            timeout=30,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -170,7 +170,7 @@ def notion_clear_page(page_id: str) -> None:
             del_resp = requests.delete(
                 f"{NOTION_API}/blocks/{block['id']}",
                 headers=notion_headers(),
-                timeout=10,
+                timeout=30,
             )
             del_resp.raise_for_status()
 
@@ -211,7 +211,7 @@ def notion_write_stickies(page_id: str, stickies: List[Tuple[str, float]]) -> No
             f"{NOTION_API}/blocks/{page_id}/children",
             headers=notion_headers(),
             json={"children": batch},
-            timeout=10,
+            timeout=30,
         )
         resp.raise_for_status()
 

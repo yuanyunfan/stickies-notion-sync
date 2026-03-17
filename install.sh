@@ -6,14 +6,21 @@ PLIST_DST="$HOME/Library/LaunchAgents/com.user.stickies-sync.plist"
 STATE_DIR="$HOME/.local/share/stickies-sync"
 LABEL="com.user.stickies-sync"
 
+# 检查 plist 源文件是否存在
+if [[ ! -f "$PLIST_SRC" ]]; then
+    echo "✗ 找不到 plist 文件: $PLIST_SRC"
+    echo "  请先创建 com.user.stickies-sync.plist"
+    exit 1
+fi
+
 echo "==> 创建状态目录"
 mkdir -p "$STATE_DIR"
 
-echo "==> 安装 LaunchAgent"
-cp "$PLIST_SRC" "$PLIST_DST"
-
 echo "==> 卸载旧任务（若存在）"
 launchctl unload "$PLIST_DST" 2>/dev/null || true
+
+echo "==> 安装 LaunchAgent"
+cp "$PLIST_SRC" "$PLIST_DST"
 
 echo "==> 加载 LaunchAgent"
 launchctl load "$PLIST_DST"
