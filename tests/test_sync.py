@@ -134,3 +134,97 @@ def test_save_and_load_state_roundtrip(tmp_path):
     data = {"hash": "abc123", "notion_page_id": "xxx-yyy"}
     save_state(path, data)
     assert load_state(path) == data
+
+
+import requests
+from sync_stickies import (
+    notion_headers,
+    notion_find_or_create_page,
+    notion_clear_page,
+    notion_write_stickies,
+    stickies_to_blocks,
+)
+
+
+def test_notion_headers_contain_auth():
+    headers = notion_headers()
+    assert "Authorization" in headers
+    assert headers["Authorization"].startswith("Bearer ")
+    assert headers["Notion-Version"] == "2022-06-28"
+
+
+def test_stickies_to_blocks_single():
+    """单条便签 → 若干 paragraph blocks，无 divider"""
+    stickies = [("line1\nline2", 1.0)]
+    blocks = stickies_to_blocks(stickies)
+    types = [b["type"] for b in blocks]
+    assert "paragraph" in types
+    assert "divider" not in types
+
+
+def test_stickies_to_blocks_multiple_has_dividers():
+    """多条便签 → 便签间有 divider"""
+    stickies = [("a", 1.0), ("b", 2.0)]
+    blocks = stickies_to_blocks(stickies)
+    types = [b["type"] for b in blocks]
+    assert "divider" in types
+    # divider 不在末尾
+    assert types[-1] == "paragraph"
+
+
+def test_stickies_to_blocks_skips_empty_lines():
+    """空行不产生 paragraph block"""
+    stickies = [("line1\n\n\nline2", 1.0)]
+    blocks = stickies_to_blocks(stickies)
+    para_texts = [
+        b["paragraph"]["rich_text"][0]["text"]["content"]
+        for b in blocks
+        if b["type"] == "paragraph"
+    ]
+    assert "" not in para_texts
+    assert len(para_texts) == 2
+
+
+def test_notion_find_or_create_page_creates_when_not_found():
+    """page_id 为 None 时调用 POST /pages"""
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {"id": "new-page-id"}
+    mock_resp.raise_for_status = MagicMock()
+    with patch("requests.post", return_value=mock_resp) as mock_post:
+        page_id = notion_find_or_create_page(None)
+    assert page_id == "new-page-id"
+    mock_post.assert_called_once()
+
+
+def test_notion_find_or_create_page_reuses_existing():
+    """page_id 已存在时直接返回，不调用 API"""
+    with patch("requests.post") as mock_post:
+        page_id = notion_find_or_create_page("existing-id")
+    assert page_id == "existing-id"
+    mock_post.assert_not_called()
+
+
+def test_notion_clear_page_handles_pagination():
+    """has_more=True 时应继续循环，直到 has_more=False 才停止"""
+    block_resp_1 = MagicMock()
+    block_resp_1.raise_for_status = MagicMock()
+    block_resp_1.json.return_value = {
+        "results": [{"id": "block-1"}],
+        "has_more": True,
+    }
+    block_resp_2 = MagicMock()
+    block_resp_2.raise_for_status = MagicMock()
+    block_resp_2.json.return_value = {"results": [], "has_more": False}
+
+    del_resp = MagicMock()
+    del_resp.raise_for_status = MagicMock()
+
+    with (
+        patch("requests.get", side_effect=[block_resp_1, block_resp_2]) as mock_get,
+        patch("requests.delete", return_value=del_resp) as mock_del,
+    ):
+        notion_clear_page("page-123")
+
+    assert mock_get.call_count == 2
+    assert mock_del.call_count == 1
