@@ -222,38 +222,48 @@ def read_stickies(stickies_dir: str) -> List[Tuple[List[List[Run]], float]]:
     读取所有 Stickies 便签，返回 [(paragraphs, mtime), ...] 按 mtime 倒序。
     paragraphs 为 List[List[Run]]，每个内层列表代表一个段落。
     空内容或解析失败的便签会被跳过。
+
+    重要：所有对 ~/Library/Containers/ 的访问均通过 subprocess 系统工具完成，
+    避免 Python 直接触碰受 TCC "Other App Data" 保护的路径，从而消除
+    LaunchAgent 运行时反复弹出的权限提示窗。
     """
-    stickies_path = Path(stickies_dir)
-    if not stickies_path.exists():
-        log.warning("Stickies 目录不存在: %s", stickies_dir)
+    # 用 find 列出所有 TXT.rtf 文件，避免 Python 直接访问受保护目录
+    find_proc = subprocess.run(
+        ["find", stickies_dir, "-name", "TXT.rtf", "-type", "f"],
+        capture_output=True,
+        text=True,
+    )
+
+    if find_proc.returncode != 0:
+        stderr = find_proc.stderr.strip()
+        if "No such file or directory" in stderr:
+            log.warning("Stickies 目录不存在: %s", stickies_dir)
+        elif "Permission denied" in stderr or "Operation not permitted" in stderr:
+            log.error("无权限访问 Stickies 目录: %s。stderr: %s", stickies_dir, stderr)
+        else:
+            log.error("find 命令失败 (returncode=%d): %s", find_proc.returncode, stderr)
+        return []
+
+    rtf_files = [p for p in find_proc.stdout.splitlines() if p.strip()]
+    if not rtf_files:
+        log.warning("Stickies 目录中未找到任何 TXT.rtf 文件: %s", stickies_dir)
         return []
 
     results: List[Tuple[List[List[Run]], float]] = []
 
-    try:
-        bundles = list(stickies_path.glob("*.rtfd"))
-    except PermissionError:
-        log.error(
-            "无权限访问 Stickies 目录。请前往：系统设置 > 隐私与安全性 > "
-            "完全磁盘访问权限，添加 /opt/miniconda3/bin/python3"
-        )
-        return []
+    for rtf_path in rtf_files:
+        bundle_name = Path(rtf_path).parent.name
 
-    for bundle in bundles:
-        rtf_file = bundle / "TXT.rtf"
-        if not rtf_file.exists():
-            log.warning("跳过无 TXT.rtf 的 bundle: %s", bundle)
-            continue
-
+        # 用 textutil 将 RTF 转为 HTML（已是 subprocess，保持不变）
         proc = subprocess.run(
-            ["textutil", "-convert", "html", "-stdout", str(rtf_file)],
+            ["textutil", "-convert", "html", "-stdout", rtf_path],
             capture_output=True,
             text=True,
             timeout=10,
         )
 
         if proc.returncode != 0:
-            log.warning("textutil 解析失败: %s", bundle.name)
+            log.warning("textutil 解析失败: %s", bundle_name)
             continue
 
         paragraphs = parse_html_to_paragraphs(proc.stdout)
@@ -261,18 +271,26 @@ def read_stickies(stickies_dir: str) -> List[Tuple[List[List[Run]], float]]:
         # 检查是否有实质性内容（至少一个 run 含非空文本）
         has_content = any(any(r["text"].strip() for r in para) for para in paragraphs)
         if not has_content:
-            log.debug("跳过空便签: %s", bundle.name)
+            log.debug("跳过空便签: %s", bundle_name)
+            continue
+
+        # 用 stat 命令获取 mtime，避免 Python 直接调用 os.stat()
+        stat_proc = subprocess.run(
+            ["stat", "-f", "%m", rtf_path],
+            capture_output=True,
+            text=True,
+        )
+
+        if stat_proc.returncode != 0:
+            log.warning("stat 命令失败，跳过: %s", bundle_name)
             continue
 
         try:
-            mtime = rtf_file.stat().st_mtime
-        except PermissionError:
-            log.error(
-                "无权限读取文件: %s。请前往：系统设置 > 隐私与安全性 > "
-                "完全磁盘访问权限，添加 /opt/miniconda3/bin/python3",
-                rtf_file,
-            )
+            mtime = float(stat_proc.stdout.strip())
+        except ValueError:
+            log.warning("stat 输出无法解析为 float，跳过: %s", stat_proc.stdout.strip())
             continue
+
         results.append((paragraphs, mtime))
 
     results.sort(key=lambda x: x[1], reverse=True)

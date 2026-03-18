@@ -166,29 +166,38 @@ def test_read_stickies_sorted_by_mtime_desc():
         old_mtime = 1000.0
         new_mtime = 2000.0
 
+        # find 命令的真实输出（两个 TXT.rtf 路径）
+        old_rtf = os.path.join(bundle1, "TXT.rtf")
+        new_rtf = os.path.join(bundle2, "TXT.rtf")
+        find_output = f"{old_rtf}\n{new_rtf}\n"
+
         def fake_run(cmd, **kwargs):
-            path = cmd[-1]
-            if "old.rtfd" in path:
-                return MagicMock(
-                    returncode=0, stdout="<html><body><p>old sticky</p></body></html>"
-                )
-            else:
-                return MagicMock(
-                    returncode=0, stdout="<html><body><p>new sticky</p></body></html>"
-                )
+            # find 命令
+            if cmd[0] == "find":
+                return MagicMock(returncode=0, stdout=find_output, stderr="")
+            # textutil 命令
+            if cmd[0] == "textutil":
+                path = cmd[-1]
+                if "old.rtfd" in path:
+                    return MagicMock(
+                        returncode=0,
+                        stdout="<html><body><p>old sticky</p></body></html>",
+                    )
+                else:
+                    return MagicMock(
+                        returncode=0,
+                        stdout="<html><body><p>new sticky</p></body></html>",
+                    )
+            # stat 命令
+            if cmd[0] == "stat":
+                path = cmd[-1]
+                if "old.rtfd" in path:
+                    return MagicMock(returncode=0, stdout=f"{int(old_mtime)}\n")
+                else:
+                    return MagicMock(returncode=0, stdout=f"{int(new_mtime)}\n")
+            return MagicMock(returncode=1, stdout="", stderr="unknown command")
 
-        def fake_stat(self, *, follow_symlinks=True):
-            m = MagicMock()
-            if "old.rtfd" in str(self):
-                m.st_mtime = old_mtime
-            else:
-                m.st_mtime = new_mtime
-            return m
-
-        with (
-            patch("sync_stickies.subprocess.run", side_effect=fake_run),
-            patch("pathlib.Path.stat", fake_stat),
-        ):
+        with patch("sync_stickies.subprocess.run", side_effect=fake_run):
             result = read_stickies(tmpdir)
 
         assert len(result) == 2
@@ -201,12 +210,21 @@ def test_read_stickies_skips_empty():
     with tempfile.TemporaryDirectory() as tmpdir:
         bundle = os.path.join(tmpdir, "empty.rtfd")
         os.makedirs(bundle)
-        open(os.path.join(bundle, "TXT.rtf"), "w").close()
+        rtf_path = os.path.join(bundle, "TXT.rtf")
+        open(rtf_path, "w").close()
 
-        with patch("sync_stickies.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0, stdout="<html><body><p>   </p></body></html>"
-            )
+        find_output = f"{rtf_path}\n"
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "find":
+                return MagicMock(returncode=0, stdout=find_output, stderr="")
+            if cmd[0] == "textutil":
+                return MagicMock(
+                    returncode=0, stdout="<html><body><p>   </p></body></html>"
+                )
+            return MagicMock(returncode=1, stdout="", stderr="")
+
+        with patch("sync_stickies.subprocess.run", side_effect=fake_run):
             result = read_stickies(tmpdir)
         assert result == []
 
@@ -216,10 +234,19 @@ def test_read_stickies_handles_textutil_failure():
     with tempfile.TemporaryDirectory() as tmpdir:
         bundle = os.path.join(tmpdir, "bad.rtfd")
         os.makedirs(bundle)
-        open(os.path.join(bundle, "TXT.rtf"), "w").close()
+        rtf_path = os.path.join(bundle, "TXT.rtf")
+        open(rtf_path, "w").close()
 
-        with patch("sync_stickies.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=1, stdout="")
+        find_output = f"{rtf_path}\n"
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "find":
+                return MagicMock(returncode=0, stdout=find_output, stderr="")
+            if cmd[0] == "textutil":
+                return MagicMock(returncode=1, stdout="")
+            return MagicMock(returncode=1, stdout="", stderr="")
+
+        with patch("sync_stickies.subprocess.run", side_effect=fake_run):
             result = read_stickies(tmpdir)
         assert result == []
 
