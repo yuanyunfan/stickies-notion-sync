@@ -230,7 +230,16 @@ def read_stickies(stickies_dir: str) -> List[Tuple[List[List[Run]], float]]:
 
     results: List[Tuple[List[List[Run]], float]] = []
 
-    for bundle in stickies_path.glob("*.rtfd"):
+    try:
+        bundles = list(stickies_path.glob("*.rtfd"))
+    except PermissionError:
+        log.error(
+            "无权限访问 Stickies 目录。请前往：系统设置 > 隐私与安全性 > "
+            "完全磁盘访问权限，添加 /opt/miniconda3/bin/python3"
+        )
+        return []
+
+    for bundle in bundles:
         rtf_file = bundle / "TXT.rtf"
         if not rtf_file.exists():
             log.warning("跳过无 TXT.rtf 的 bundle: %s", bundle)
@@ -255,7 +264,15 @@ def read_stickies(stickies_dir: str) -> List[Tuple[List[List[Run]], float]]:
             log.debug("跳过空便签: %s", bundle.name)
             continue
 
-        mtime = rtf_file.stat().st_mtime
+        try:
+            mtime = rtf_file.stat().st_mtime
+        except PermissionError:
+            log.error(
+                "无权限读取文件: %s。请前往：系统设置 > 隐私与安全性 > "
+                "完全磁盘访问权限，添加 /opt/miniconda3/bin/python3",
+                rtf_file,
+            )
+            continue
         results.append((paragraphs, mtime))
 
     results.sort(key=lambda x: x[1], reverse=True)
