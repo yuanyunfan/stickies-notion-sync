@@ -312,8 +312,7 @@ def load_state(state_file: str = STATE_FILE) -> dict:
     """读取 state.json，损坏或缺失时返回默认值。"""
     default = {"hash": None, "notion_page_id": None}
     try:
-        with open(state_file, "r", encoding="utf-8") as f:
-            return json.load(f)
+        return json.load(open(state_file, "r", encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
         return default
 
@@ -334,34 +333,9 @@ def notion_headers() -> dict:
     }
 
 
-def notion_find_or_create_page(page_id: str | None) -> str:
-    """
-    若 page_id 已有则直接返回；否则先搜索 "Mac stickies" 页面，
-    找到则复用，找不到才创建（需要 integration 有对应 parent 访问权限）。
-    """
-    if page_id:
-        return page_id
-
-    # 先搜索已有页面
-    log.info("搜索已有 Notion 页面: %s", PAGE_TITLE)
-    search_resp = requests.post(
-        f"{NOTION_API}/search",
-        headers=notion_headers(),
-        json={"query": PAGE_TITLE, "filter": {"value": "page", "property": "object"}},
-        timeout=30,
-    )
-    search_resp.raise_for_status()
-    results = search_resp.json().get("results", [])
-    for page in results:
-        props = page.get("properties", {})
-        title_parts = props.get("title", {}).get("title", [])
-        title_text = "".join(p.get("plain_text", "") for p in title_parts)
-        if title_text.strip() == PAGE_TITLE:
-            found_id = page["id"]
-            log.info("找到已有页面: %s", found_id)
-            return found_id
-
-    log.info("未找到已有页面，创建新页面: %s", PAGE_TITLE)
+def notion_create_page() -> str:
+    """在 workspace 根级别创建新的空白页面，返回 page_id。"""
+    log.info("创建新页面: %s", PAGE_TITLE)
     resp = requests.post(
         f"{NOTION_API}/pages",
         headers=notion_headers(),
@@ -377,34 +351,16 @@ def notion_find_or_create_page(page_id: str | None) -> str:
     return resp.json()["id"]
 
 
-def notion_clear_page(page_id: str) -> None:
-    """删除页面中所有现有 blocks。"""
-    log.info("清空页面 blocks: %s", page_id)
-    cursor = None
-    while True:
-        params = {"start_cursor": cursor} if cursor else {}
-        resp = requests.get(
-            f"{NOTION_API}/blocks/{page_id}/children",
-            headers=notion_headers(),
-            params=params,
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-        for block in data.get("results", []):
-            if block.get("archived") or block.get("in_trash"):
-                continue
-            del_resp = requests.delete(
-                f"{NOTION_API}/blocks/{block['id']}",
-                headers=notion_headers(),
-                timeout=30,
-            )
-            del_resp.raise_for_status()
-
-        if not data.get("has_more"):
-            break
-        cursor = data.get("next_cursor")
+def notion_archive_page(page_id: str) -> None:
+    """归档（软删除）指定页面，只需一次 PATCH 请求。"""
+    log.info("归档页面: %s", page_id)
+    resp = requests.patch(
+        f"{NOTION_API}/pages/{page_id}",
+        headers=notion_headers(),
+        json={"archived": True},
+        timeout=30,
+    )
+    resp.raise_for_status()
 
 
 def stickies_to_blocks(stickies: List[Tuple[List[List[Run]], float]]) -> list:
@@ -461,30 +417,71 @@ def main(
     stickies_dir: str = STICKIES_DIR,
     state_file: str = STATE_FILE,
 ) -> None:
-    """主同步流程。"""
+    """主同步流程（Shadow Page 方案）。"""
     # 1. 读取便签
     stickies = read_stickies(stickies_dir)
     if not stickies:
         log.info("没有便签，退出")
         return
 
-    # 2. 计算 hash，与上次对比
+    # 2. 计算 hash，加载 state
     current_hash = compute_hash(stickies)
     state = load_state(state_file)
 
+    # 3. 启动清理：若 pending_page_id 存在 → 上次写入中途中断，归档残留影子页
+    if state.get("pending_page_id"):
+        log.warning(
+            "检测到未完成的影子页面 %s，归档并重新同步", state["pending_page_id"]
+        )
+        try:
+            notion_archive_page(state["pending_page_id"])
+        except Exception as e:
+            log.warning("归档 pending_page_id 失败（忽略）: %s", e)
+        state = {k: v for k, v in state.items() if k != "pending_page_id"}
+        save_state(state_file, state)
+
+    # 4. 启动清理：若 old_page_id 存在 → 上次归档未完成，补做归档
+    if state.get("old_page_id"):
+        log.info("清理上次遗留的旧页面 %s", state["old_page_id"])
+        try:
+            notion_archive_page(state["old_page_id"])
+        except Exception as e:
+            log.warning("归档 old_page_id 失败（忽略）: %s", e)
+        state = {k: v for k, v in state.items() if k != "old_page_id"}
+        save_state(state_file, state)
+
+    # 5. hash 相同 → 跳过
     if state["hash"] == current_hash:
         log.info("内容无变化，跳过同步")
         return
 
     log.info("检测到内容变化，开始同步到 Notion")
 
-    # 3. 同步到 Notion
-    page_id = notion_find_or_create_page(state.get("notion_page_id"))
-    notion_clear_page(page_id)
-    notion_write_stickies(page_id, stickies)
+    # 6. 创建新的空白影子页
+    shadow_id = notion_create_page()
 
-    # 4. 更新状态
-    save_state(state_file, {"hash": current_hash, "notion_page_id": page_id})
+    # 7. 记录影子页 ID（中断后启动可归档）
+    old_id = state.get("notion_page_id")
+    save_state(state_file, {**state, "pending_page_id": shadow_id})
+
+    # 8. 写入全部内容到影子页（旧页面此时完好）
+    notion_write_stickies(shadow_id, stickies)
+
+    # 9. 原子切换：state 指向新页面，记录旧页待归档
+    state = {"hash": current_hash, "notion_page_id": shadow_id}
+    if old_id:
+        state["old_page_id"] = old_id
+    save_state(state_file, state)
+
+    # 10. 归档旧页
+    if old_id:
+        try:
+            notion_archive_page(old_id)
+        except Exception as e:
+            log.warning("归档旧页面失败（下次启动时重试）: %s", e)
+
+    # 11. 清理 old_page_id
+    save_state(state_file, {"hash": current_hash, "notion_page_id": shadow_id})
     log.info("同步完成")
 
 

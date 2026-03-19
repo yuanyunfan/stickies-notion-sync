@@ -11,8 +11,8 @@ from sync_stickies import (
     load_state,
     save_state,
     notion_headers,
-    notion_find_or_create_page,
-    notion_clear_page,
+    notion_create_page,
+    notion_archive_page,
     notion_write_stickies,
     stickies_to_blocks,
     main,
@@ -372,66 +372,40 @@ def test_stickies_to_blocks_annotations():
     assert rt["annotations"]["color"] == "red"
 
 
-# ── notion_find_or_create_page ────────────────────────────────────────────────
+# ── notion_create_page ────────────────────────────────────────────────────────
 
 
-def test_notion_find_or_create_page_creates_when_not_found():
-    """page_id 为 None 且搜索无结果时调用 POST /pages 创建"""
-    mock_search_resp = MagicMock()
-    mock_search_resp.status_code = 200
-    mock_search_resp.json.return_value = {"results": []}
-    mock_search_resp.raise_for_status = MagicMock()
+def test_notion_create_page_calls_post():
+    """notion_create_page 应调用 POST /pages 并返回新页面 ID"""
+    mock_resp = MagicMock()
+    mock_resp.raise_for_status = MagicMock()
+    mock_resp.json.return_value = {"id": "new-page-id"}
 
-    mock_create_resp = MagicMock()
-    mock_create_resp.status_code = 200
-    mock_create_resp.json.return_value = {"id": "new-page-id"}
-    mock_create_resp.raise_for_status = MagicMock()
+    with patch("requests.post", return_value=mock_resp) as mock_post:
+        page_id = notion_create_page()
 
-    with patch(
-        "requests.post", side_effect=[mock_search_resp, mock_create_resp]
-    ) as mock_post:
-        page_id = notion_find_or_create_page(None)
     assert page_id == "new-page-id"
-    assert mock_post.call_count == 2
+    mock_post.assert_called_once()
+    call_url = mock_post.call_args[0][0]
+    assert call_url.endswith("/pages")
 
 
-def test_notion_find_or_create_page_reuses_existing():
-    """page_id 已存在时直接返回，不调用 API"""
-    with patch("requests.post") as mock_post:
-        page_id = notion_find_or_create_page("existing-id")
-    assert page_id == "existing-id"
-    mock_post.assert_not_called()
+# ── notion_archive_page ───────────────────────────────────────────────────────
 
 
-# ── notion_clear_page ─────────────────────────────────────────────────────────
+def test_notion_archive_page_calls_patch_with_archived_true():
+    """notion_archive_page 应调用 PATCH /pages/{id} 并携带 archived=True"""
+    mock_resp = MagicMock()
+    mock_resp.raise_for_status = MagicMock()
 
+    with patch("requests.patch", return_value=mock_resp) as mock_patch:
+        notion_archive_page("page-to-archive")
 
-def test_notion_clear_page_handles_pagination():
-    """has_more=True 时应继续循环，第二次请求携带 start_cursor"""
-    block_resp_1 = MagicMock()
-    block_resp_1.raise_for_status = MagicMock()
-    block_resp_1.json.return_value = {
-        "results": [{"id": "block-1"}],
-        "has_more": True,
-        "next_cursor": "cursor-abc",
-    }
-    block_resp_2 = MagicMock()
-    block_resp_2.raise_for_status = MagicMock()
-    block_resp_2.json.return_value = {"results": [], "has_more": False}
-
-    del_resp = MagicMock()
-    del_resp.raise_for_status = MagicMock()
-
-    with (
-        patch("requests.get", side_effect=[block_resp_1, block_resp_2]) as mock_get,
-        patch("requests.delete", return_value=del_resp) as mock_del,
-    ):
-        notion_clear_page("page-123")
-
-    assert mock_get.call_count == 2
-    assert mock_del.call_count == 1
-    second_call_kwargs = mock_get.call_args_list[1][1]
-    assert second_call_kwargs.get("params", {}).get("start_cursor") == "cursor-abc"
+    mock_patch.assert_called_once()
+    call_url = mock_patch.call_args[0][0]
+    assert "page-to-archive" in call_url
+    call_body = mock_patch.call_args[1]["json"]
+    assert call_body == {"archived": True}
 
 
 # ── notion_write_stickies ─────────────────────────────────────────────────────
@@ -468,7 +442,10 @@ def test_main_no_change_skips_notion(tmp_path):
     stickies = [_simple_sticky("hello")]
     current_hash = compute_hash(stickies)
     state_file = str(tmp_path / "state.json")
-    save_state(state_file, {"hash": current_hash, "notion_page_id": "existing-id"})
+    save_state(
+        state_file,
+        {"hash": current_hash, "notion_page_id": "existing-id"},
+    )
 
     with (
         patch("sync_stickies.read_stickies", return_value=stickies),
@@ -484,42 +461,49 @@ def test_main_no_change_skips_notion(tmp_path):
 
 
 def test_main_with_change_calls_notion(tmp_path):
-    """hash 变化时调用 Notion 清空 + 写入"""
+    """hash 变化时：创建新页、写入内容、归档旧页，state 更新为新页面 ID"""
     stickies = [_simple_sticky("new content")]
     state_file = str(tmp_path / "state.json")
-    save_state(state_file, {"hash": "old_hash", "notion_page_id": "existing-id"})
+    save_state(
+        state_file,
+        {"hash": "old_hash", "notion_page_id": "old-page-id"},
+    )
 
-    mock_get_resp = MagicMock()
-    mock_get_resp.status_code = 200
-    mock_get_resp.json.return_value = {"results": [], "has_more": False}
-    mock_get_resp.raise_for_status = MagicMock()
+    mock_post_resp = MagicMock()
+    mock_post_resp.raise_for_status = MagicMock()
+    mock_post_resp.json.return_value = {"id": "shadow-page-id"}
 
     mock_patch_resp = MagicMock()
-    mock_patch_resp.status_code = 200
     mock_patch_resp.raise_for_status = MagicMock()
 
     with (
         patch("sync_stickies.read_stickies", return_value=stickies),
-        patch("requests.get", return_value=mock_get_resp),
+        patch("requests.post", return_value=mock_post_resp),
         patch("requests.patch", return_value=mock_patch_resp),
     ):
         main(state_file=state_file)
 
     new_state = load_state(state_file)
     assert new_state["hash"] == compute_hash(stickies)
-    assert new_state["notion_page_id"] == "existing-id"
+    assert new_state["notion_page_id"] == "shadow-page-id"
+    assert "write_complete" not in new_state
+    assert "pending_page_id" not in new_state
+    assert "old_page_id" not in new_state
 
 
 def test_main_api_failure_does_not_update_state(tmp_path):
-    """Notion API 抛出异常时，state.json 不应被更新"""
+    """Notion API 抛出异常（创建页面失败）时，state.json 不应被更新"""
     stickies = [_simple_sticky("some content")]
     old_hash = "old_hash"
     state_file = str(tmp_path / "state.json")
-    save_state(state_file, {"hash": old_hash, "notion_page_id": "existing-id"})
+    save_state(
+        state_file,
+        {"hash": old_hash, "notion_page_id": "existing-id"},
+    )
 
     with (
         patch("sync_stickies.read_stickies", return_value=stickies),
-        patch("requests.get", side_effect=Exception("API unreachable")),
+        patch("requests.post", side_effect=Exception("API unreachable")),
     ):
         try:
             main(state_file=state_file)
@@ -528,3 +512,110 @@ def test_main_api_failure_does_not_update_state(tmp_path):
 
     state_after = load_state(state_file)
     assert state_after["hash"] == old_hash
+
+
+def test_main_recovers_from_interrupted_write(tmp_path):
+    """state 含 pending_page_id 时，启动应归档残留影子页并重新同步"""
+    stickies = [_simple_sticky("same content")]
+    current_hash = compute_hash(stickies)
+    state_file = str(tmp_path / "state.json")
+    # 模拟上次写入中途中断：pending_page_id 存在
+    save_state(
+        state_file,
+        {
+            "hash": "old_hash",
+            "notion_page_id": "active-page-id",
+            "pending_page_id": "broken-shadow-id",
+        },
+    )
+
+    mock_post_resp = MagicMock()
+    mock_post_resp.raise_for_status = MagicMock()
+    mock_post_resp.json.return_value = {"id": "new-shadow-id"}
+
+    mock_patch_resp = MagicMock()
+    mock_patch_resp.raise_for_status = MagicMock()
+
+    with (
+        patch("sync_stickies.read_stickies", return_value=stickies),
+        patch("requests.post", return_value=mock_post_resp),
+        patch("requests.patch", return_value=mock_patch_resp) as mock_patch,
+    ):
+        main(state_file=state_file)
+
+    # 应归档 broken-shadow-id + 写入 + 归档 active-page-id
+    patch_urls = [call[0][0] for call in mock_patch.call_args_list]
+    assert any("broken-shadow-id" in u for u in patch_urls), "应归档 pending_page_id"
+    assert any("active-page-id" in u for u in patch_urls), "应归档旧页面"
+
+    new_state = load_state(state_file)
+    assert new_state["hash"] == current_hash
+    assert new_state["notion_page_id"] == "new-shadow-id"
+    assert "pending_page_id" not in new_state
+    assert "old_page_id" not in new_state
+
+
+def test_main_cleans_up_old_page_on_startup(tmp_path):
+    """state 含 old_page_id 时，启动应先归档旧页，再判断 hash"""
+    stickies = [_simple_sticky("hello")]
+    current_hash = compute_hash(stickies)
+    state_file = str(tmp_path / "state.json")
+    # 模拟上次归档旧页未完成
+    save_state(
+        state_file,
+        {
+            "hash": current_hash,
+            "notion_page_id": "current-page-id",
+            "old_page_id": "stale-old-id",
+        },
+    )
+
+    mock_patch_resp = MagicMock()
+    mock_patch_resp.raise_for_status = MagicMock()
+
+    with (
+        patch("sync_stickies.read_stickies", return_value=stickies),
+        patch("requests.patch", return_value=mock_patch_resp) as mock_patch,
+        patch("requests.post") as mock_post,
+    ):
+        main(state_file=state_file)
+
+    # 应归档 stale-old-id（哪怕 hash 相同也要先清理）
+    patch_urls = [call[0][0] for call in mock_patch.call_args_list]
+    assert any("stale-old-id" in u for u in patch_urls), "应归档 old_page_id"
+    # hash 相同，不应创建新页面
+    mock_post.assert_not_called()
+
+    new_state = load_state(state_file)
+    assert "old_page_id" not in new_state
+
+
+def test_main_archives_old_page_after_successful_sync(tmp_path):
+    """成功同步后旧页面应被归档，且 state 中不含 old_page_id"""
+    stickies = [_simple_sticky("updated")]
+    state_file = str(tmp_path / "state.json")
+    save_state(
+        state_file,
+        {"hash": "old_hash", "notion_page_id": "old-page-id"},
+    )
+
+    mock_post_resp = MagicMock()
+    mock_post_resp.raise_for_status = MagicMock()
+    mock_post_resp.json.return_value = {"id": "new-page-id"}
+
+    mock_patch_resp = MagicMock()
+    mock_patch_resp.raise_for_status = MagicMock()
+
+    with (
+        patch("sync_stickies.read_stickies", return_value=stickies),
+        patch("requests.post", return_value=mock_post_resp),
+        patch("requests.patch", return_value=mock_patch_resp) as mock_patch,
+    ):
+        main(state_file=state_file)
+
+    patch_urls = [call[0][0] for call in mock_patch.call_args_list]
+    assert any("old-page-id" in u for u in patch_urls), "旧页面应被归档"
+
+    new_state = load_state(state_file)
+    assert new_state["notion_page_id"] == "new-page-id"
+    assert "old_page_id" not in new_state
